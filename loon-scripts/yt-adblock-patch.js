@@ -113,7 +113,8 @@
   // 返回 { bytes, dropped }：
   // - 子树无 pagead → 直接返回原切片（零拷贝）
   // - 子树不是合法 protobuf（纯字符串/二进制 blob）→ 原样保留，交由上层判断
-  // - 合法 message → 递归清理后，删掉仍含 pagead 的 LD 字段（广告容器）
+  // - 合法 message → 递归清理后，删掉仍含 pagead 的 LD 字段（广告容器），
+  //   以及被掏空的容器（避免留下客户端渲染不了的空壳 section）
   function cleanRange(buf, s, e) {
     if (!containsPagead(buf, s, e)) return { bytes: buf.subarray(s, e), dropped: 0 };
     var pr = parseFields(buf, s, e);
@@ -126,13 +127,18 @@
       if (f.wt === 2) {
         var cleaned = cleanRange(buf, f.vStart, f.vEnd);
         dropped += cleaned.dropped;
-        if (containsPagead(cleaned.bytes, 0, cleaned.bytes.length)) {
+        var cbytes = cleaned.bytes;
+        if (cbytes.length === 0 && f.vEnd > f.vStart) {
+          dropped++; // 广告容器被掏空：整个删掉，不留空壳
+          continue;
+        }
+        if (containsPagead(cbytes, 0, cbytes.length)) {
           dropped++; // 子树仍含广告信号：整个字段是广告容器，删掉
           continue;
         }
         chunks.push(buf.subarray(f.tagStart, f.tagEnd)); // tag 原字节保留
-        chunks.push(encodeVarint(cleaned.bytes.length));
-        chunks.push(cleaned.bytes);
+        chunks.push(encodeVarint(cbytes.length));
+        chunks.push(cbytes);
       } else {
         chunks.push(buf.subarray(f.tagStart, f.fEnd)); // 非 LD 字段原样保留
       }
@@ -151,6 +157,13 @@
     if (!body || body.length === 0) { $done({}); return; }
     var r = cleanRange(body, 0, body.length);
     if (r.dropped > 0) {
+      if (r.bytes.length < body.length * 0.45) {
+        // 熔断：删除量超过 55% 说明可能误删，直接放行保页面
+        console.log('[yt-ad-patch] over-deletion guard (' + body.length +
+          ' -> ' + r.bytes.length + '), passthrough');
+        $done({});
+        return;
+      }
       console.log('[yt-ad-patch] dropped ' + r.dropped + ' ad field(s), ' +
         body.length + ' -> ' + r.bytes.length + ' bytes');
       $done({ body: r.bytes });
